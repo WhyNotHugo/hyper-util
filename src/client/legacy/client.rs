@@ -607,11 +607,7 @@ where
                                         Ok(_) => {
                                             // Log that the connection is ready for use.
                                             trace!("connection is ready");
-                                            // Drop the error receiver, as it’s no longer needed since the sender is ready.
-                                            // This prevents waiting for errors that won’t occur in a successful case.
-                                            drop(err_rx);
-                                            // Wrap the sender in PoolTx::Http1 for use in the connection pool.
-                                            PoolTx::Http1(tx)
+                                            PoolTx::Http1 { tx, err_rx }
                                         }
                                         // If the sender fails with a closed channel error, check for a specific connection error.
                                         // This distinguishes between a vague ChannelClosed error and an actual connection failure.
@@ -770,7 +766,11 @@ struct PoolClient<B> {
 
 enum PoolTx<B> {
     #[cfg(feature = "http1")]
-    Http1(hyper::client::conn::http1::SendRequest<B>),
+    Http1 {
+        tx: hyper::client::conn::http1::SendRequest<B>,
+        // Receiver for  during response streaming.
+        err_rx: tokio::sync::oneshot::Receiver<hyper::Error>,
+    },
     #[cfg(feature = "http2")]
     Http2(hyper::client::conn::http2::SendRequest<B>),
 }
@@ -782,7 +782,25 @@ impl<B> PoolClient<B> {
     ) -> Poll<Result<(), Error>> {
         match self.tx {
             #[cfg(feature = "http1")]
-            PoolTx::Http1(ref mut tx) => tx.poll_ready(cx).map_err(Error::closed),
+            PoolTx::Http1 {
+                ref mut tx,
+                ref mut err_rx,
+            } => {
+                match tx.poll_ready(cx) {
+                    Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+                    Poll::Ready(Err(e)) if e.is_closed() => {
+                        // The connection task died. Check the error channel for the specific error.
+                        match Pin::new(err_rx).poll(cx) {
+                            Poll::Ready(Ok(err)) => Poll::Ready(Err(Error::tx(err))),
+                            Poll::Ready(Err(_)) | Poll::Pending => {
+                                Poll::Ready(Err(Error::closed(e)))
+                            }
+                        }
+                    }
+                    Poll::Ready(Err(e)) => Poll::Ready(Err(Error::tx(e))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
             #[cfg(feature = "http2")]
             PoolTx::Http2(_) => Poll::Ready(Ok(())),
         }
@@ -795,7 +813,7 @@ impl<B> PoolClient<B> {
     fn is_http2(&self) -> bool {
         match self.tx {
             #[cfg(feature = "http1")]
-            PoolTx::Http1(_) => false,
+            PoolTx::Http1 { .. } => false,
             #[cfg(feature = "http2")]
             PoolTx::Http2(_) => true,
         }
@@ -808,7 +826,7 @@ impl<B> PoolClient<B> {
     fn is_ready(&self) -> bool {
         match self.tx {
             #[cfg(feature = "http1")]
-            PoolTx::Http1(ref tx) => tx.is_ready(),
+            PoolTx::Http1 { ref tx, .. } => tx.is_ready(),
             #[cfg(feature = "http2")]
             PoolTx::Http2(ref tx) => tx.is_ready(),
         }
@@ -826,7 +844,7 @@ impl<B: Body + 'static> PoolClient<B> {
         #[cfg(all(feature = "http1", feature = "http2"))]
         return match self.tx {
             #[cfg(feature = "http1")]
-            PoolTx::Http1(ref mut tx) => Either::Left(tx.try_send_request(req)),
+            PoolTx::Http1 { ref mut tx, .. } => Either::Left(tx.try_send_request(req)),
             #[cfg(feature = "http2")]
             PoolTx::Http2(ref mut tx) => Either::Right(tx.try_send_request(req)),
         };
@@ -835,7 +853,7 @@ impl<B: Body + 'static> PoolClient<B> {
         #[cfg(not(feature = "http2"))]
         return match self.tx {
             #[cfg(feature = "http1")]
-            PoolTx::Http1(ref mut tx) => tx.try_send_request(req),
+            PoolTx::Http1 { ref mut tx, .. } => tx.try_send_request(req),
         };
 
         #[cfg(not(feature = "http1"))]
@@ -858,9 +876,9 @@ where
     fn reserve(self) -> pool::Reservation<Self> {
         match self.tx {
             #[cfg(feature = "http1")]
-            PoolTx::Http1(tx) => pool::Reservation::Unique(PoolClient {
+            PoolTx::Http1 { tx, err_rx } => pool::Reservation::Unique(PoolClient {
                 conn_info: self.conn_info,
-                tx: PoolTx::Http1(tx),
+                tx: PoolTx::Http1 { tx, err_rx },
             }),
             #[cfg(feature = "http2")]
             PoolTx::Http2(tx) => {
